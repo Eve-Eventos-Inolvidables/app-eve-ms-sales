@@ -7,7 +7,6 @@ import com.example.appevemssales.Client.PriceGatewayClient;
 import com.example.appevemssales.Repository.IBuyRepository;
 import com.example.appevemssales.Repository.ITicketRepository;
 import jakarta.persistence.criteria.Predicate;
-import lombok.extern.slf4j.Slf4j;
 import org.openapitools.model.BuyDto;
 import org.openapitools.model.CreateBuyDto;
 import org.openapitools.model.SectorByBatchDto;
@@ -16,13 +15,12 @@ import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
-import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-@Slf4j
 @Service
 public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyFilter> {
 
@@ -71,27 +69,14 @@ public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyF
         validatePerPersonLimit(dto.getEventId(), selectedIds.size(),
                 event.getTicketsPerPersonLimit(), authenticatedUserId);
 
-        List<SectorByBatchDto> consumedPrices = priceGatewayClient.consumeStock(
-                dto.getEventId(), selectedIds, authorizationHeader);
-        try {
-            Map<Long, SectorByBatchDto> pricesById =
-                    validatePriceResponse(requestedCounts, consumedPrices);
-            int total = calculateTotal(requestedCounts, pricesById);
-            return persistenceService.persist(dto, total, authenticatedUserId);
-        } catch (RuntimeException purchaseFailure) {
-            try {
-                priceGatewayClient.releaseStock(
-                        dto.getEventId(), selectedIds, authorizationHeader);
-            } catch (RuntimeException compensationFailure) {
-                log.error(
-                        "No se pudo restaurar el stock para el evento {} después de fallar la compra del usuario {}",
-                        dto.getEventId(),
-                        authenticatedUserId,
-                        compensationFailure);
-                purchaseFailure.addSuppressed(compensationFailure);
-            }
-            throw purchaseFailure;
-        }
+        List<Long> uniqueIds = List.copyOf(requestedCounts.keySet());
+        List<SectorByBatchDto> priceDtos = priceGatewayClient.getPricesForEvent(
+                dto.getEventId(), uniqueIds, authorizationHeader);
+        Map<Long, SectorByBatchDto> pricesById =
+                validatePriceResponse(requestedCounts, priceDtos);
+        validateStock(requestedCounts, pricesById);
+        int total = calculateTotal(requestedCounts, pricesById);
+        return persistenceService.persist(dto, total, authenticatedUserId);
     }
 
     public BuyDto getByIdForUser(Long buyId, Long userId) {
@@ -128,6 +113,33 @@ public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyF
         if (alreadyPurchased >= limit || requestedCount > limit - alreadyPurchased) {
             throw new PurchaseLimitExceededException(
                     "La cantidad solicitada supera el límite de entradas por persona.");
+        }
+    }
+
+    private void validateStock(
+            Map<Long, Long> requestedCounts,
+            Map<Long, SectorByBatchDto> pricesById) {
+        Map<Long, Long> soldCounts = new HashMap<>();
+        for (Object[] row : ticketRepository.countSoldTicketsBySectorByBatchIds(
+                requestedCounts.keySet())) {
+            Long sectorByBatchId = ((Number) row[0]).longValue();
+            Long soldCount = ((Number) row[1]).longValue();
+            soldCounts.put(sectorByBatchId, soldCount);
+        }
+
+        for (Map.Entry<Long, Long> selection : requestedCounts.entrySet()) {
+            Integer totalCapacity = pricesById.get(selection.getKey()).getQuantity();
+            if (totalCapacity == null || totalCapacity < 0) {
+                throw new PriceGatewayException(
+                        502, "El servicio de precios devolvió una capacidad inválida.");
+            }
+
+            long alreadySold = soldCounts.getOrDefault(selection.getKey(), 0L);
+            if (alreadySold + selection.getValue() > totalCapacity) {
+                throw new StockUnavailableException(
+                        "No hay stock suficiente para el sector/tanda "
+                                + selection.getKey() + ".");
+            }
         }
     }
 

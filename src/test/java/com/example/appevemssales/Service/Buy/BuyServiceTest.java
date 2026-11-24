@@ -11,7 +11,9 @@ import org.openapitools.model.SectorByBatchDto;
 import org.openapitools.model.SimpleEventDto;
 
 import java.time.LocalDate;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -43,13 +45,13 @@ class BuyServiceTest {
     }
 
     @Test
-    void createConsumesStockAndPassesAuthenticatedUserAndTotalToTransactionService() {
+    void createChecksCapacityAndPassesAuthenticatedUserAndTotalToTransactionService() {
         long authenticatedUserId = 7L;
         CreateBuyDto dto = createDto(42L, List.of(10L, 10L, 20L));
         BuyDto result = new BuyDto();
         stubOpenEvent(5);
-        when(priceGatewayClient.consumeStock(
-                42L, List.of(10L, 10L, 20L), AUTHORIZATION))
+        when(priceGatewayClient.getPricesForEvent(
+                42L, List.of(10L, 20L), AUTHORIZATION))
                 .thenReturn(List.of(price(10L, 200), price(20L, 350)));
         when(persistenceService.persist(dto, 750, authenticatedUserId)).thenReturn(result);
 
@@ -58,48 +60,60 @@ class BuyServiceTest {
         assertSame(result, actual);
         verify(priceGatewayClient).getEventById(42L, AUTHORIZATION);
         verify(ticketRepository).countByBuy_User_IdAndBuy_Event_Id(authenticatedUserId, 42L);
-        verify(priceGatewayClient).consumeStock(
-                42L, List.of(10L, 10L, 20L), AUTHORIZATION);
+        verify(priceGatewayClient).getPricesForEvent(
+                42L, List.of(10L, 20L), AUTHORIZATION);
+        verify(ticketRepository).countSoldTicketsBySectorByBatchIds(Set.of(10L, 20L));
         verify(persistenceService).persist(dto, 750, authenticatedUserId);
     }
 
     @Test
-    void createRestoresStockIfGatewayReturnsAnIncompletePriceResponse() {
+    void createRejectsIfGatewayReturnsAnIncompletePriceResponse() {
         CreateBuyDto dto = createDto(42L, List.of(10L, 20L));
         stubOpenEvent(5);
-        when(priceGatewayClient.consumeStock(
+        when(priceGatewayClient.getPricesForEvent(
                 42L, List.of(10L, 20L), AUTHORIZATION))
                 .thenReturn(List.of(price(10L, 200)));
 
         assertThrows(com.example.appevecommon.Service.Exception.ResourceNotFoundException.class,
                 () -> service.create(dto, 7L, AUTHORIZATION));
-        verify(priceGatewayClient).releaseStock(42L, List.of(10L, 20L), AUTHORIZATION);
         verifyNoInteractions(persistenceService);
     }
 
     @Test
-    void createRestoresStockIfGatewayReturnsDuplicateRows() {
+    void createRejectsIfGatewayReturnsDuplicateRows() {
         CreateBuyDto dto = createDto(42L, List.of(10L));
         stubOpenEvent(5);
-        when(priceGatewayClient.consumeStock(42L, List.of(10L), AUTHORIZATION))
+        when(priceGatewayClient.getPricesForEvent(42L, List.of(10L), AUTHORIZATION))
                 .thenReturn(List.of(price(10L, 200), price(10L, 200)));
 
         assertThrows(PriceGatewayException.class,
                 () -> service.create(dto, 7L, AUTHORIZATION));
-        verify(priceGatewayClient).releaseStock(42L, List.of(10L), AUTHORIZATION);
         verifyNoInteractions(persistenceService);
     }
 
     @Test
-    void createRestoresStockIfTotalDoesNotFitBuyIntegerColumn() {
+    void createRejectsIfTotalDoesNotFitBuyIntegerColumn() {
         CreateBuyDto dto = createDto(42L, List.of(10L, 10L));
         stubOpenEvent(5);
-        when(priceGatewayClient.consumeStock(42L, List.of(10L, 10L), AUTHORIZATION))
+        when(priceGatewayClient.getPricesForEvent(42L, List.of(10L), AUTHORIZATION))
                 .thenReturn(List.of(price(10L, Integer.MAX_VALUE)));
 
         assertThrows(InvalidBuyRequestException.class,
                 () -> service.create(dto, 7L, AUTHORIZATION));
-        verify(priceGatewayClient).releaseStock(42L, List.of(10L, 10L), AUTHORIZATION);
+        verifyNoInteractions(persistenceService);
+    }
+
+    @Test
+    void createRejectsWhenPreviouslySoldAndRequestedTicketsExceedCapacity() {
+        CreateBuyDto dto = createDto(42L, List.of(10L, 10L));
+        stubOpenEvent(5);
+        when(priceGatewayClient.getPricesForEvent(42L, List.of(10L), AUTHORIZATION))
+                .thenReturn(List.of(price(10L, 200, 3)));
+        when(ticketRepository.countSoldTicketsBySectorByBatchIds(Set.of(10L)))
+                .thenReturn(Collections.singletonList(new Object[] {10L, 2L}));
+
+        assertThrows(StockUnavailableException.class,
+                () -> service.create(dto, 7L, AUTHORIZATION));
         verifyNoInteractions(persistenceService);
     }
 
@@ -111,7 +125,7 @@ class BuyServiceTest {
 
         assertThrows(PurchaseLimitExceededException.class,
                 () -> service.create(dto, 7L, AUTHORIZATION));
-        verify(priceGatewayClient, never()).consumeStock(any(), any(), any());
+        verify(priceGatewayClient, never()).getPricesForEvent(any(), any(), any());
         verifyNoInteractions(persistenceService);
     }
 
@@ -142,9 +156,14 @@ class BuyServiceTest {
     }
 
     private SectorByBatchDto price(long id, int amount) {
+        return price(id, amount, 100);
+    }
+
+    private SectorByBatchDto price(long id, int amount, int quantity) {
         SectorByBatchDto dto = new SectorByBatchDto();
         dto.setId(id);
         dto.setPrice(amount);
+        dto.setQuantity(quantity);
         return dto;
     }
 }

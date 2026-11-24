@@ -4,7 +4,6 @@ import com.example.appevecommon.Service.Exception.ResourceNotFoundException;
 import com.example.appevecommon.Service.Utilities.Responses.Response;
 import com.example.appevemssales.Service.Buy.InvalidBuyRequestException;
 import com.example.appevemssales.Service.Buy.PriceGatewayException;
-import com.example.appevemssales.Service.Buy.StockUnavailableException;
 import org.openapitools.model.SimpleEventDto;
 import org.openapitools.model.SectorByBatchDto;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,15 +27,11 @@ public class PriceGatewayClient {
             new ParameterizedTypeReference<>() {};
     private static final ParameterizedTypeReference<Response<SimpleEventDto>> EVENT_RESPONSE_TYPE =
             new ParameterizedTypeReference<>() {};
-    private static final ParameterizedTypeReference<Response<Void>> EMPTY_RESPONSE_TYPE =
-            new ParameterizedTypeReference<>() {};
 
     private final RestClient restClient;
-    private final String stockCommandKey;
 
     public PriceGatewayClient(
-            @Value("${app.gateway.base-url:http://localhost:8080}") String gatewayBaseUrl,
-            @Value("${app.events.stock-command-key:}") String stockCommandKey) {
+            @Value("${app.gateway.base-url:http://localhost:8080}") String gatewayBaseUrl) {
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(
                 HttpClient.newBuilder()
                         .connectTimeout(Duration.ofSeconds(2))
@@ -47,7 +42,6 @@ public class PriceGatewayClient {
                 .baseUrl(gatewayBaseUrl)
                 .requestFactory(requestFactory)
                 .build();
-        this.stockCommandKey = stockCommandKey;
     }
 
     public SimpleEventDto getEventById(Long eventId, String authorizationHeader) {
@@ -71,65 +65,29 @@ public class PriceGatewayClient {
         }
     }
 
-    public List<SectorByBatchDto> consumeStock(
+    public List<SectorByBatchDto> getPricesForEvent(
             Long eventId,
-            List<Long> selectedSectorByBatchIds,
+            List<Long> uniqueSectorByBatchIds,
             String authorizationHeader) {
-        ensureStockCommandKeyConfigured();
         try {
             Response<List<SectorByBatchDto>> response = restClient.post()
-                    .uri("/app-eve-ms-events/api/precio/consume?eventId={eventId}", eventId)
+                    .uri("/app-eve-ms-events/api/precio/lookup?eventId={eventId}", eventId)
                     .header(HttpHeaders.AUTHORIZATION, authorizationHeader)
-                    .header("X-Sales-Stock-Key", stockCommandKey)
                     .contentType(MediaType.APPLICATION_JSON)
-                    .body(selectedSectorByBatchIds)
+                    .body(uniqueSectorByBatchIds)
                     .retrieve()
                     .body(RESPONSE_TYPE);
 
             if (response == null || !response.success() || response.data() == null) {
                 throw new PriceGatewayException(
-                        502, "El servicio de stock devolvió una respuesta inválida.");
+                        502, "El servicio de precios devolvió una respuesta inválida.");
             }
             return response.data();
         } catch (RestClientResponseException ex) {
             throw mapGatewayFailure(ex);
         } catch (RestClientException ex) {
             throw new PriceGatewayException(
-                    503, "El servicio de stock no está disponible.", ex);
-        }
-    }
-
-    public void releaseStock(
-            Long eventId,
-            List<Long> selectedSectorByBatchIds,
-            String authorizationHeader) {
-        ensureStockCommandKeyConfigured();
-        try {
-            Response<Void> response = restClient.post()
-                    .uri("/app-eve-ms-events/api/precio/release?eventId={eventId}", eventId)
-                    .header(HttpHeaders.AUTHORIZATION, authorizationHeader)
-                    .header("X-Sales-Stock-Key", stockCommandKey)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(selectedSectorByBatchIds)
-                    .retrieve()
-                    .body(EMPTY_RESPONSE_TYPE);
-
-            if (response == null || !response.success()) {
-                throw new PriceGatewayException(
-                        502, "El servicio de stock no confirmó la compensación.");
-            }
-        } catch (RestClientResponseException ex) {
-            throw mapGatewayFailure(ex);
-        } catch (RestClientException ex) {
-            throw new PriceGatewayException(
-                    503, "No se pudo contactar al servicio para compensar el stock.", ex);
-        }
-    }
-
-    private void ensureStockCommandKeyConfigured() {
-        if (stockCommandKey == null || stockCommandKey.isBlank()) {
-            throw new PriceGatewayException(
-                    503, "Falta configurar la credencial interna para modificar stock.");
+                    503, "El servicio de precios no está disponible.", ex);
         }
     }
 
@@ -143,13 +101,13 @@ public class PriceGatewayClient {
             return new ResourceNotFoundException(
                     "No se encontró el evento o uno de los precios solicitados.");
         }
-        if (remoteStatus == 409) {
-            return new StockUnavailableException(
-                    "No hay stock suficiente para una o más selecciones.");
-        }
         if (remoteStatus == 401 || remoteStatus == 403) {
             return new PriceGatewayException(
                     remoteStatus, "No se autorizó la operación en el servicio de eventos.", ex);
+        }
+        if (remoteStatus == 409) {
+            return new PriceGatewayException(
+                    409, "El servicio de eventos no pudo resolver la solicitud.", ex);
         }
         return new PriceGatewayException(
                 502, "No se pudo completar la operación en el servicio de eventos.", ex);
