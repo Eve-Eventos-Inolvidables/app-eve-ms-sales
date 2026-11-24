@@ -1,156 +1,150 @@
 package com.example.appevemssales.Service.Buy;
 
-import com.example.appevecommon.Models.Buy.Buy;
-import com.example.appevecommon.Models.Buy.Ticket;
-import com.example.appevecommon.Models.Event.Batch.Batch;
-import com.example.appevecommon.Models.Event.Batch.SectorByBatch;
-import com.example.appevecommon.Models.Event.SimpleEvent;
-import com.example.appevecommon.Models.Event.Sector.Sector;
-import com.example.appevecommon.Models.User.User;
-import com.example.appevecommon.Service.Exception.ResourceNotFoundException;
+import com.example.appevemssales.Client.PriceGatewayClient;
 import com.example.appevemssales.Repository.IBuyRepository;
-import com.example.appevemssales.Repository.ISectorByBatchRepository;
 import com.example.appevemssales.Repository.ITicketRepository;
-import jakarta.persistence.EntityManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.openapitools.model.BuyDto;
 import org.openapitools.model.CreateBuyDto;
-import org.springframework.test.util.ReflectionTestUtils;
+import org.openapitools.model.SectorByBatchDto;
+import org.openapitools.model.SimpleEventDto;
 
-import java.util.ArrayList;
+import java.time.LocalDate;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyIterable;
 import static org.mockito.Mockito.*;
 
 class BuyServiceTest {
 
+    private static final String AUTHORIZATION = "Bearer test-jwt";
+
     private IBuyRepository buyRepository;
     private ITicketRepository ticketRepository;
-    private ISectorByBatchRepository sectorByBatchRepository;
     private BuyMapper mapper;
-    private EntityManager entityManager;
+    private PriceGatewayClient priceGatewayClient;
+    private BuyPersistenceService persistenceService;
     private BuyService service;
 
     @BeforeEach
     void setUp() {
         buyRepository = mock(IBuyRepository.class);
         ticketRepository = mock(ITicketRepository.class);
-        sectorByBatchRepository = mock(ISectorByBatchRepository.class);
         mapper = mock(BuyMapper.class);
-        entityManager = mock(EntityManager.class);
-
+        priceGatewayClient = mock(PriceGatewayClient.class);
+        persistenceService = mock(BuyPersistenceService.class);
         service = new BuyService(
                 buyRepository,
                 ticketRepository,
-                sectorByBatchRepository,
-                mapper);
-        ReflectionTestUtils.setField(service, "entityManager", entityManager);
+                mapper,
+                priceGatewayClient,
+                persistenceService);
     }
 
     @Test
-    void createCalculatesServerTotalAndCreatesOneTicketPerSelection() {
-        long eventId = 42L;
-        long userId = 7L;
-        CreateBuyDto dto = createDto(eventId, userId, List.of(10L, 10L, 20L));
-        SectorByBatch first = sectorByBatch(10L, 200, eventId);
-        SectorByBatch second = sectorByBatch(20L, 350, eventId);
-        SimpleEvent event = new SimpleEvent();
-        event.setId(eventId);
-        User user = new User();
-        user.setId(userId);
+    void createConsumesStockAndPassesAuthenticatedUserAndTotalToTransactionService() {
+        long authenticatedUserId = 7L;
+        CreateBuyDto dto = createDto(42L, List.of(10L, 10L, 20L));
+        BuyDto result = new BuyDto();
+        stubOpenEvent(5);
+        when(priceGatewayClient.consumeStock(
+                42L, List.of(10L, 10L, 20L), AUTHORIZATION))
+                .thenReturn(List.of(price(10L, 200), price(20L, 350)));
+        when(persistenceService.persist(dto, 750, authenticatedUserId)).thenReturn(result);
 
-        when(sectorByBatchRepository.findAllById(anyIterable()))
-                .thenReturn(List.of(first, second));
-        when(entityManager.find(SimpleEvent.class, eventId)).thenReturn(event);
-        when(entityManager.find(User.class, userId)).thenReturn(user);
-        when(mapper.toEntity(dto)).thenReturn(new Buy());
-        when(buyRepository.save(any(Buy.class)))
-                .thenAnswer(invocation -> invocation.getArgument(0));
-        when(mapper.toDto(any(Buy.class))).thenReturn(new BuyDto());
-        List<Ticket> createdTickets = new ArrayList<>();
-        when(ticketRepository.saveAll(anyIterable())).thenAnswer(invocation -> {
-            Iterable<Ticket> requestedTickets = invocation.getArgument(0);
-            requestedTickets.forEach(createdTickets::add);
-            return createdTickets;
-        });
+        BuyDto actual = service.create(dto, authenticatedUserId, AUTHORIZATION);
 
-        BuyDto result = service.create(dto);
-
-        assertNotNull(result);
-        var buyCaptor = org.mockito.ArgumentCaptor.forClass(Buy.class);
-        verify(buyRepository).save(buyCaptor.capture());
-        Buy savedBuy = buyCaptor.getValue();
-        assertEquals(750, savedBuy.getTotal());
-        assertNotNull(savedBuy.getDate());
-        assertSame(event, savedBuy.getEvent());
-        assertSame(user, savedBuy.getUser());
-
-        verify(ticketRepository).saveAll(anyIterable());
-        assertEquals(3, createdTickets.size());
-        assertEquals(2, createdTickets.stream()
-                .filter(ticket -> ticket.getSectorByBatch().getId().equals(10L))
-                .count());
-        assertTrue(createdTickets.stream().allMatch(ticket -> ticket.getBuy() == savedBuy));
-        assertTrue(createdTickets.stream().allMatch(ticket -> ticket.getQrToken() != null));
-        assertEquals(3, createdTickets.stream().map(Ticket::getQrToken).distinct().count());
+        assertSame(result, actual);
+        verify(priceGatewayClient).getEventById(42L, AUTHORIZATION);
+        verify(ticketRepository).countByBuy_User_IdAndBuy_Event_Id(authenticatedUserId, 42L);
+        verify(priceGatewayClient).consumeStock(
+                42L, List.of(10L, 10L, 20L), AUTHORIZATION);
+        verify(persistenceService).persist(dto, 750, authenticatedUserId);
     }
 
     @Test
-    void createRejectsUnknownOrArchivedSectorByBatchBeforeSaving() {
-        CreateBuyDto dto = createDto(42L, 7L, List.of(404L));
-        when(sectorByBatchRepository.findAllById(anyIterable())).thenReturn(List.of());
+    void createRestoresStockIfGatewayReturnsAnIncompletePriceResponse() {
+        CreateBuyDto dto = createDto(42L, List.of(10L, 20L));
+        stubOpenEvent(5);
+        when(priceGatewayClient.consumeStock(
+                42L, List.of(10L, 20L), AUTHORIZATION))
+                .thenReturn(List.of(price(10L, 200)));
 
-        assertThrows(ResourceNotFoundException.class, () -> service.create(dto));
-        verifyNoInteractions(buyRepository, ticketRepository);
+        assertThrows(com.example.appevecommon.Service.Exception.ResourceNotFoundException.class,
+                () -> service.create(dto, 7L, AUTHORIZATION));
+        verify(priceGatewayClient).releaseStock(42L, List.of(10L, 20L), AUTHORIZATION);
+        verifyNoInteractions(persistenceService);
     }
 
     @Test
-    void createRejectsSectorByBatchFromAnotherEventBeforeSaving() {
-        CreateBuyDto dto = createDto(42L, 7L, List.of(10L));
-        when(sectorByBatchRepository.findAllById(anyIterable()))
-                .thenReturn(List.of(sectorByBatch(10L, 200, 99L)));
+    void createRestoresStockIfGatewayReturnsDuplicateRows() {
+        CreateBuyDto dto = createDto(42L, List.of(10L));
+        stubOpenEvent(5);
+        when(priceGatewayClient.consumeStock(42L, List.of(10L), AUTHORIZATION))
+                .thenReturn(List.of(price(10L, 200), price(10L, 200)));
 
-        assertThrows(InvalidBuyRequestException.class, () -> service.create(dto));
-        verifyNoInteractions(buyRepository, ticketRepository);
+        assertThrows(PriceGatewayException.class,
+                () -> service.create(dto, 7L, AUTHORIZATION));
+        verify(priceGatewayClient).releaseStock(42L, List.of(10L), AUTHORIZATION);
+        verifyNoInteractions(persistenceService);
     }
 
     @Test
-    void createRejectsTotalThatDoesNotFitBuyIntegerColumn() {
-        CreateBuyDto dto = createDto(42L, 7L, List.of(10L, 10L));
-        when(sectorByBatchRepository.findAllById(anyIterable()))
-                .thenReturn(List.of(sectorByBatch(10L, Integer.MAX_VALUE, 42L)));
+    void createRestoresStockIfTotalDoesNotFitBuyIntegerColumn() {
+        CreateBuyDto dto = createDto(42L, List.of(10L, 10L));
+        stubOpenEvent(5);
+        when(priceGatewayClient.consumeStock(42L, List.of(10L, 10L), AUTHORIZATION))
+                .thenReturn(List.of(price(10L, Integer.MAX_VALUE)));
 
-        assertThrows(InvalidBuyRequestException.class, () -> service.create(dto));
-        verifyNoInteractions(buyRepository, ticketRepository);
+        assertThrows(InvalidBuyRequestException.class,
+                () -> service.create(dto, 7L, AUTHORIZATION));
+        verify(priceGatewayClient).releaseStock(42L, List.of(10L, 10L), AUTHORIZATION);
+        verifyNoInteractions(persistenceService);
     }
 
-    private CreateBuyDto createDto(long eventId, long userId, List<Long> ids) {
+    @Test
+    void createRejectsPerPersonLimitBeforeConsumingStock() {
+        CreateBuyDto dto = createDto(42L, List.of(10L, 20L));
+        stubOpenEvent(2);
+        when(ticketRepository.countByBuy_User_IdAndBuy_Event_Id(7L, 42L)).thenReturn(1L);
+
+        assertThrows(PurchaseLimitExceededException.class,
+                () -> service.create(dto, 7L, AUTHORIZATION));
+        verify(priceGatewayClient, never()).consumeStock(any(), any(), any());
+        verifyNoInteractions(persistenceService);
+    }
+
+    @Test
+    void createRejectsInvalidAuthenticatedUserBeforeCallingOtherServices() {
+        CreateBuyDto dto = createDto(42L, List.of(10L));
+
+        assertThrows(InvalidAuthenticatedUserException.class,
+                () -> service.create(dto, 0L, AUTHORIZATION));
+        verifyNoInteractions(priceGatewayClient, persistenceService);
+    }
+
+    private CreateBuyDto createDto(long eventId, List<Long> ids) {
         CreateBuyDto dto = new CreateBuyDto();
         dto.setEventId(eventId);
-        dto.setUserId(userId);
-        dto.setSectorByBatchIds(new ArrayList<>(ids));
+        dto.setSectorByBatchIds(ids);
         return dto;
     }
 
-    private SectorByBatch sectorByBatch(long id, int price, long eventId) {
-        SimpleEvent event = new SimpleEvent();
-        event.setId(eventId);
+    private void stubOpenEvent(int ticketLimit) {
+        SimpleEventDto event = new SimpleEventDto();
+        event.setId(42L);
+        event.setArchived(false);
+        event.setVisibleStart(LocalDate.now().minusDays(1));
+        event.setDate(LocalDate.now().plusDays(1));
+        event.setTicketsPerPersonLimit(ticketLimit);
+        when(priceGatewayClient.getEventById(42L, AUTHORIZATION)).thenReturn(event);
+    }
 
-        Sector sector = new Sector();
-        sector.setEvent(event);
-
-        Batch batch = new Batch();
-        batch.setEvent(event);
-
-        SectorByBatch sectorByBatch = new SectorByBatch();
-        sectorByBatch.setId(id);
-        sectorByBatch.setPrice(price);
-        sectorByBatch.setSector(sector);
-        sectorByBatch.setBatch(batch);
-        return sectorByBatch;
+    private SectorByBatchDto price(long id, int amount) {
+        SectorByBatchDto dto = new SectorByBatchDto();
+        dto.setId(id);
+        dto.setPrice(amount);
+        return dto;
     }
 }

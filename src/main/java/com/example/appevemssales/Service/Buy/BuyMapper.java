@@ -15,6 +15,6 @@ public abstract class BuyMapper implements ReadableMapper<Buy, BuyDto> {
     public abstract BuyDto toDto(Buy entity);
 
     @Mapping(source = "eventId", target = "event.id")
-    @Mapping(source = "userId", target = "user.id")
+    @Mapping(target = "user", ignore = true)
     public abstract Buy toEntity(CreateBuyDto dto);
 }

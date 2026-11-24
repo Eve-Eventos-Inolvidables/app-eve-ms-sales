@@ -9,4 +9,6 @@ import lombok.Setter;
 public class TicketFilter extends PagedFilter {
     private Long buyId;
     private Long sectorByBatchId;
+    private Long eventId;
+    private Long userId;
 }
