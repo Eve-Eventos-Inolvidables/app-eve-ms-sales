@@ -2,6 +2,7 @@ package com.example.appevemssales.Service.Buy;
 
 import com.example.appevecommon.Models.Buy.Buy;
 import com.example.appevecommon.Service.AbstractBaseService;
+import com.example.appevecommon.Service.Email.EmailService;
 import com.example.appevecommon.Service.Exception.ResourceNotFoundException;
 import com.example.appevemssales.Client.PriceGatewayClient;
 import com.example.appevemssales.Repository.IBuyRepository;
@@ -11,6 +12,7 @@ import org.openapitools.model.BuyDto;
 import org.openapitools.model.CreateBuyDto;
 import org.openapitools.model.SectorByBatchDto;
 import org.openapitools.model.SimpleEventDto;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 
@@ -29,6 +31,8 @@ public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyF
     private final PriceGatewayClient priceGatewayClient;
     private final BuyPersistenceService persistenceService;
 
+    @Autowired
+    private EmailService emailService;
     public BuyService(
             IBuyRepository buyRepository,
             ITicketRepository ticketRepository,
@@ -45,6 +49,7 @@ public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyF
     public BuyDto create(
             CreateBuyDto dto,
             Long authenticatedUserId,
+            String authenticatedUserEmail,
             String authorizationHeader) {
         if (dto == null) {
             throw new InvalidBuyRequestException("El cuerpo de la compra es obligatorio.");
@@ -63,20 +68,35 @@ public class BuyService extends AbstractBaseService<Buy, BuyDto, BuyMapper, BuyF
         }
 
         Map<Long, Long> requestedCounts = countSelections(selectedIds);
+
         SimpleEventDto event = priceGatewayClient.getEventById(
                 dto.getEventId(), authorizationHeader);
+
         validateEventIsOpen(event);
+
         validatePerPersonLimit(dto.getEventId(), selectedIds.size(),
                 event.getTicketsPerPersonLimit(), authenticatedUserId);
 
         List<Long> uniqueIds = List.copyOf(requestedCounts.keySet());
+
         List<SectorByBatchDto> priceDtos = priceGatewayClient.getPricesForEvent(
                 dto.getEventId(), uniqueIds, authorizationHeader);
+
         Map<Long, SectorByBatchDto> pricesById =
                 validatePriceResponse(requestedCounts, priceDtos);
+
         validateStock(requestedCounts, pricesById);
+
         int total = calculateTotal(requestedCounts, pricesById);
-        return persistenceService.persist(dto, total, authenticatedUserId);
+
+        BuyDto result = persistenceService.persist(dto, total, authenticatedUserId);
+
+        if(authenticatedUserEmail != null) {
+            emailService.asyncSendEmailSafely(authenticatedUserEmail,
+                    "Gracias por su compra! Ticket/s para:" + event.getName(),
+                    "Su compra se ha concretado exitosamente! Total: " +  total + " Gs.");
+        }
+        return result;
     }
 
     public BuyDto getByIdForUser(Long buyId, Long userId) {

@@ -52,10 +52,11 @@ public class BuyController extends BaseController<Buy, BuyDto, BuyFilter, BuySer
             @AuthenticationPrincipal Jwt jwt,
             @RequestHeader(HttpHeaders.AUTHORIZATION) String authorizationHeader) {
         Long authenticatedUserId = userIdResolver.resolve(jwt);
+        String userEmail = jwt.getSubject();
         log.info("Se solicitó crear una compra para el evento {} y el usuario {}",
                 dto == null ? null : dto.getEventId(), authenticatedUserId);
         return ResponseFactory.resourceCreated(
-                service.create(dto, authenticatedUserId, authorizationHeader));
+                service.create(dto, authenticatedUserId,userEmail, authorizationHeader));
     }
 
     @ExceptionHandler(InvalidAuthenticatedUserException.class)
